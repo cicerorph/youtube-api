@@ -77,14 +77,6 @@ async def verify_admin_api_key(api_key: str = Depends(api_key_header)):
     
     return api_key
 
-if settings.AUTO_CLEAN_CACHE:
-    try:
-        print("Checking for expired cache files...")
-        cleaned_count = clean_expired_cache_files()
-        print(f"Cleaned {cleaned_count} expired cache files")
-    except Exception as e:
-        print(f"Error cleaning cache on startup: {str(e)}")
-
 FFMPEG_PATH = settings.FFMPEG_PATH or shutil.which("ffmpeg")
 FFMPEG_AVAILABLE = FFMPEG_PATH is not None
 
@@ -116,6 +108,14 @@ def clean_expired_cache_files() -> int:
             except Exception as e:
                 print(f"Error removing expired file {file_path}: {str(e)}")
     return cleaned_count
+
+if settings.AUTO_CLEAN_CACHE:
+    try:
+        print("Checking for expired cache files...")
+        cleaned_count = clean_expired_cache_files()
+        print(f"Cleaned {cleaned_count} expired cache files")
+    except Exception as e:
+        print(f"Error cleaning cache on startup: {str(e)}")
 
 async def get_or_create_cached_file(video_id: str, quality: Optional[str] = None) -> Tuple[str, bool]:
     cache_key = get_cache_key(video_id, quality)
