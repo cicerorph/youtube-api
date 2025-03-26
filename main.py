@@ -399,7 +399,7 @@ async def get_video_info(video_id: str):
         class FormatCollector:
             def __init__(self):
                 self.formats = []
-            
+
             def debug(self, msg):
                 if "format code" in msg and "resolution" in msg:
                     parts = msg.split()
@@ -409,6 +409,14 @@ async def get_video_info(video_id: str):
                             height = resolution.split('x')[1]
                             if height.isdigit():
                                 available_qualities.add(f"{height}p")
+
+            def warning(self, msg):
+                # Empty method to satisfy yt-dlp logger interface
+                pass
+
+            def error(self, msg):
+                # Empty method to satisfy yt-dlp logger interface
+                pass
         
         collector = FormatCollector()
         
