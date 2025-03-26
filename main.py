@@ -696,7 +696,7 @@ async def embed_youtube_video(
             controls 
             crossorigin 
             playsinline 
-            {'poster="' + video_info.get('thumbnail_url', '') + '"' if not audio_only else ''}>
+            {'poster="https://corsproxy.io/?url=' + video_info.get('thumbnail_url', '') + '"' if not audio_only else ''}>
             <source 
                 src="{source_url}" 
                 type="{'video/mp4' if not audio_only else 'audio/mp4'}">
@@ -728,7 +728,8 @@ async def embed_youtube_video(
                     'current-time',
                     'mute',
                     'volume',
-                    {'audio_only': "['download']" if audio_only else "['captions', 'download', 'fullscreen']"}
+                    'fullscreen',
+                    'download'
                 ],
                 tooltips: {{
                     controls: true,
