@@ -1,5 +1,5 @@
 from fastapi import FastAPI, HTTPException, Query, Depends, Header, Request
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import APIKeyHeader
 from pytubefix import YouTube
@@ -16,6 +16,7 @@ from typing import Optional, Dict, Tuple, List
 import yt_dlp
 from enum import Enum
 from datetime import datetime, timedelta
+import json
 
 from config import settings
 
@@ -632,6 +633,110 @@ async def get_api_status(request: Request):
             "high_quality_support": FFMPEG_AVAILABLE
         }
     }
+
+@app.get("/embed/{video_id}", response_class=HTMLResponse)
+async def embed_youtube_video(
+    video_id: str, 
+    quality: str = Query(None, description=f"Desired video quality (e.g., '1080p', '720p', '480p', '360p'). Default: {settings.DEFAULT_QUALITY}"),
+    audio_only: bool = Query(False, description="Embed audio-only player")
+):
+    try:
+        video_info = await get_video_info(video_id)
+
+        if quality is None:
+            quality = settings.DEFAULT_QUALITY
+
+        source_url = f"/video/{video_id}?quality={quality}"
+        if audio_only:
+            source_url += "&audio_only=true"
+
+        html_content = f"""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{video_info['title']} - YouTube Embed</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/plyr/3.7.8/plyr.min.css">
+    <style>
+        body {{ 
+            margin: 0; 
+            font-family: Arial, sans-serif; 
+            background-color: #000; 
+            display: flex; 
+            justify-content: center; 
+            align-items: center; 
+            min-height: 100vh;
+        }}
+        .plyr {{ 
+            max-width: 100%; 
+            width: 100%; 
+            max-height: 100vh; 
+        }}
+        .video-info {{
+            color: white;
+            text-align: center;
+            padding: 10px;
+            background-color: rgba(0,0,0,0.7);
+        }}
+    </style>
+</head>
+<body>
+    <div>
+        <{'video' if not audio_only else 'audio'} 
+            id="player" 
+            controls 
+            crossorigin 
+            playsinline 
+            {'poster="' + video_info.get('thumbnail_url', '') + '"' if not audio_only else ''}>
+            <source 
+                src="{source_url}" 
+                type="{'video/mp4' if not audio_only else 'audio/mp4'}">
+            Your browser does not support the video tag.
+        </{f"{'video' if not audio_only else 'audio'}"}
+        
+        <div class="video-info">
+            <h3>{video_info['title']}</h3>
+            <p>
+                {video_info['author']} • {video_info['views']:,} views
+                {'• ' + f"{video_info['length'] // 60}:{video_info['length'] % 60:02d} duration" if not audio_only else ''}
+            </p>
+        </div>
+    </div>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/plyr/3.7.8/plyr.min.js"></script>
+    <script>
+        document.addEventListener('DOMContentLoaded', () => {{
+            const player = new Plyr('#player', {{
+                quality: {{
+                    default: '{quality.replace('p', '')}',
+                    options: {json.dumps([int(q.replace('p', '')) for q in video_info['available_qualities']])},
+                    forced: true
+                }},
+                controls: [
+                    'play-large',
+                    'play',
+                    'progress',
+                    'current-time',
+                    'mute',
+                    'volume',
+                    {'audio_only': "['download']" if audio_only else "['captions', 'download', 'fullscreen']"}
+                ],
+                tooltips: {{
+                    controls: true,
+                    seek: true
+                }}
+            }});
+        }});
+    </script>
+</body>
+</html>
+        """
+        
+        return HTMLResponse(content=html_content)
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error creating embed: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn
