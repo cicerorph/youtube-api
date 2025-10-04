@@ -36,7 +36,12 @@ if settings.ENABLE_RATE_LIMIT:
     
     @app.middleware("http")
     async def rate_limit_middleware(request: Request, call_next):
+        # Bypass rate limit for admin API key
         if settings.ADMIN_API_KEY and request.headers.get("X-API-Key") == settings.ADMIN_API_KEY:
+            return await call_next(request)
+        
+        # Bypass rate limit for /job/ endpoint
+        if request.url.path.startswith("/job/"):
             return await call_next(request)
             
         client_ip = request.client.host
@@ -66,6 +71,55 @@ if settings.ENABLE_RATE_LIMIT:
         return response
 
 os.makedirs(settings.CACHE_DIR, exist_ok=True)
+
+# Job tracking system
+JOBS_FILE = os.path.join(settings.CACHE_DIR, "jobs.json")
+download_jobs: Dict[str, Dict] = {}
+
+def load_jobs():
+    """Load jobs from disk"""
+    global download_jobs
+    if os.path.exists(JOBS_FILE):
+        try:
+            with open(JOBS_FILE, 'r') as f:
+                download_jobs = json.load(f)
+        except Exception as e:
+            print(f"Error loading jobs: {str(e)}")
+            download_jobs = {}
+    else:
+        download_jobs = {}
+
+def save_jobs():
+    """Save jobs to disk"""
+    try:
+        with open(JOBS_FILE, 'w') as f:
+            json.dump(download_jobs, f, indent=2)
+    except Exception as e:
+        print(f"Error saving jobs: {str(e)}")
+
+def clean_expired_jobs():
+    """Remove jobs for expired cache files"""
+    global download_jobs
+    cleaned_count = 0
+    jobs_to_remove = []
+    
+    for job_key, job_data in download_jobs.items():
+        if job_data.get('status') == 'completed':
+            cache_path = job_data.get('cache_path')
+            if cache_path and (not os.path.exists(cache_path) or is_cache_file_expired(cache_path)):
+                jobs_to_remove.append(job_key)
+                cleaned_count += 1
+    
+    for job_key in jobs_to_remove:
+        del download_jobs[job_key]
+    
+    if jobs_to_remove:
+        save_jobs()
+    
+    return cleaned_count
+
+# Load existing jobs on startup
+load_jobs()
 
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
@@ -115,6 +169,9 @@ if settings.AUTO_CLEAN_CACHE:
         print("Checking for expired cache files...")
         cleaned_count = clean_expired_cache_files()
         print(f"Cleaned {cleaned_count} expired cache files")
+        
+        jobs_cleaned = clean_expired_jobs()
+        print(f"Cleaned {jobs_cleaned} expired jobs")
     except Exception as e:
         print(f"Error cleaning cache on startup: {str(e)}")
 
@@ -245,6 +302,7 @@ async def download_audio_only(video_id: str, output_path: str, format_type: str 
 
 @app.get("/video/{video_id}")
 async def stream_youtube_video(
+    request: Request,
     video_id: str, 
     quality: str = Query(None, description=f"Desired video quality (e.g., '1080p', '720p', '480p', '360p'). Default: {settings.DEFAULT_QUALITY}"),
     format_type: FormatType = Query(FormatType.MP4, description="Video format type"),
@@ -297,9 +355,34 @@ async def stream_youtube_video(
             else:
                 raise HTTPException(status_code=404, detail=f"File not found. Download may have failed.")
         
+        # Get file size for Range header support
+        file_size = os.path.getsize(cache_path)
+        
+        # Parse Range header
+        range_header = request.headers.get("range")
+        start = 0
+        end = file_size - 1
+        
+        if range_header:
+            range_match = range_header.replace("bytes=", "").split("-")
+            start = int(range_match[0]) if range_match[0] else 0
+            end = int(range_match[1]) if range_match[1] else file_size - 1
+            
+            if start >= file_size or end >= file_size:
+                raise HTTPException(status_code=416, detail="Requested range not satisfiable")
+        
+        content_length = end - start + 1
+        
         def iterfile():
             with open(cache_path, 'rb') as f:
-                while chunk := f.read(1024 * 1024):
+                f.seek(start)
+                remaining = content_length
+                while remaining > 0:
+                    chunk_size = min(1024 * 1024, remaining)
+                    chunk = f.read(chunk_size)
+                    if not chunk:
+                        break
+                    remaining -= len(chunk)
                     yield chunk
         
         mime_types = {
@@ -313,13 +396,24 @@ async def stream_youtube_video(
         ext = os.path.splitext(cache_path)[1][1:]
         mime_type = mime_types.get(ext, "application/octet-stream")
         
+        headers = {
+            "Content-Type": mime_type,
+            "Content-Disposition": f"inline; filename={video_id}{os.path.splitext(cache_path)[1]}",
+            "Accept-Ranges": "bytes",
+            "Content-Length": str(content_length),
+        }
+        
+        if range_header:
+            headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
+            status_code = 206  # Partial Content
+        else:
+            status_code = 200
+        
         return StreamingResponse(
             iterfile(),
             media_type=mime_type,
-            headers={
-                "Content-Disposition": f"inline; filename={video_id}{os.path.splitext(cache_path)[1]}",
-                "Content-Type": mime_type
-            }
+            status_code=status_code,
+            headers=headers
         )
     
     except Exception as e:
@@ -328,6 +422,200 @@ async def stream_youtube_video(
         print(f"Error in stream_youtube_video: {error_detail}")
         print(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Error retrieving content: {error_detail}")
+
+@app.post("/request/{video_id}")
+async def request_video_download(
+    video_id: str,
+    quality: str = Query(None, description=f"Desired video quality (e.g., '1080p', '720p', '480p', '360p'). Default: {settings.DEFAULT_QUALITY}"),
+    format_type: FormatType = Query(FormatType.MP4, description="Video format type"),
+    audio_only: bool = Query(False, description="Get audio-only stream")
+):
+    """Request a video download as a background job"""
+    if quality is None:
+        quality = settings.DEFAULT_QUALITY
+    
+    try:
+        # Create job key
+        cache_key = f"{video_id}_{quality if quality else 'best'}"
+        if audio_only:
+            cache_key += f"_audio_{format_type}"
+        job_key = hashlib.md5(cache_key.encode()).hexdigest()
+        
+        file_ext = format_type.value
+        cache_path = os.path.join(settings.CACHE_DIR, f"{job_key}.{file_ext}")
+        
+        # Check if file already exists
+        if os.path.exists(cache_path) and os.path.getsize(cache_path) > 0 and not is_cache_file_expired(cache_path):
+            # File already cached
+            if job_key not in download_jobs or download_jobs[job_key].get('status') != 'completed':
+                download_jobs[job_key] = {
+                    'video_id': video_id,
+                    'quality': quality,
+                    'format_type': format_type.value,
+                    'audio_only': audio_only,
+                    'status': 'completed',
+                    'cache_path': cache_path,
+                    'file_size': os.path.getsize(cache_path),
+                    'created_at': datetime.now().isoformat(),
+                    'completed_at': datetime.now().isoformat(),
+                    'message': 'File already cached'
+                }
+                save_jobs()
+            
+            return {
+                'job_id': job_key,
+                'video_id': video_id,
+                'status': 'completed',
+                'message': 'Video already cached and ready'
+            }
+        
+        # Check if job already exists
+        if job_key in download_jobs:
+            existing_job = download_jobs[job_key]
+            if existing_job.get('status') in ['pending', 'downloading']:
+                return {
+                    'job_id': job_key,
+                    'video_id': video_id,
+                    'status': existing_job.get('status'),
+                    'message': 'Download already in progress'
+                }
+        
+        # Create new job
+        download_jobs[job_key] = {
+            'video_id': video_id,
+            'quality': quality,
+            'format_type': format_type.value,
+            'audio_only': audio_only,
+            'status': 'pending',
+            'cache_path': cache_path,
+            'created_at': datetime.now().isoformat(),
+            'message': 'Download queued'
+        }
+        save_jobs()
+        
+        # Start download in background
+        async def download_task():
+            try:
+                download_jobs[job_key]['status'] = 'downloading'
+                download_jobs[job_key]['started_at'] = datetime.now().isoformat()
+                save_jobs()
+                
+                if audio_only:
+                    await download_audio_only(video_id, cache_path, format_type)
+                else:
+                    quality_level = 0
+                    if quality:
+                        try:
+                            quality_level = int(quality.replace('p', ''))
+                        except ValueError:
+                            pass
+                    
+                    if format_type != FormatType.MP4 or quality_level > 720:
+                        try:
+                            await download_with_ytdlp(video_id, quality, cache_path)
+                        except Exception as e:
+                            print(f"Error with yt-dlp: {str(e)}, falling back to PyTubeFix")
+                            if format_type == FormatType.MP4:
+                                await download_with_pytube(video_id, quality, cache_path)
+                            else:
+                                raise Exception(f"Format {format_type} requires yt-dlp which failed. Error: {str(e)}")
+                    else:
+                        await download_with_pytube(video_id, quality, cache_path)
+                
+                # Check for alternate file extensions
+                if not os.path.exists(cache_path):
+                    base_path = os.path.splitext(cache_path)[0]
+                    for ext in [f'.{format_type}', '.mp4', '.mkv', '.webm', '.mp4.mkv', '.mp4.webm', '.m4a', '.mp3']:
+                        alt_path = f"{base_path}{ext}"
+                        if os.path.exists(alt_path):
+                            cache_path_final = alt_path
+                            download_jobs[job_key]['cache_path'] = cache_path_final
+                            break
+                    else:
+                        raise FileNotFoundError(f"Could not find downloaded file for {video_id}")
+                else:
+                    cache_path_final = cache_path
+                
+                download_jobs[job_key]['status'] = 'completed'
+                download_jobs[job_key]['completed_at'] = datetime.now().isoformat()
+                download_jobs[job_key]['file_size'] = os.path.getsize(cache_path_final)
+                download_jobs[job_key]['message'] = 'Download completed successfully'
+                save_jobs()
+                
+            except Exception as e:
+                download_jobs[job_key]['status'] = 'failed'
+                download_jobs[job_key]['error'] = str(e)
+                download_jobs[job_key]['completed_at'] = datetime.now().isoformat()
+                download_jobs[job_key]['message'] = f'Download failed: {str(e)}'
+                save_jobs()
+        
+        # Run download in background
+        asyncio.create_task(download_task())
+        
+        return {
+            'job_id': job_key,
+            'video_id': video_id,
+            'status': 'pending',
+            'message': 'Download started'
+        }
+        
+    except Exception as e:
+        import traceback
+        error_detail = str(e)
+        print(f"Error in request_video_download: {error_detail}")
+        print(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"Error creating download request: {error_detail}")
+
+@app.get("/job/{job_id}")
+async def get_job_status(job_id: str):
+    """Get the status of a download job"""
+    if job_id not in download_jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+    
+    job_data = download_jobs[job_id]
+    
+    response = {
+        'job_id': job_id,
+        'video_id': job_data.get('video_id'),
+        'quality': job_data.get('quality'),
+        'format_type': job_data.get('format_type'),
+        'audio_only': job_data.get('audio_only'),
+        'status': job_data.get('status'),
+        'message': job_data.get('message'),
+        'created_at': job_data.get('created_at'),
+    }
+    
+    # Add optional fields based on status
+    if job_data.get('started_at'):
+        response['started_at'] = job_data.get('started_at')
+    
+    if job_data.get('completed_at'):
+        response['completed_at'] = job_data.get('completed_at')
+    
+    if job_data.get('file_size'):
+        response['file_size'] = job_data.get('file_size')
+        response['file_size_mb'] = round(job_data.get('file_size') / (1024 * 1024), 2)
+    
+    if job_data.get('error'):
+        response['error'] = job_data.get('error')
+    
+    # If completed, provide download URL
+    if job_data.get('status') == 'completed':
+        cache_path = job_data.get('cache_path')
+        if cache_path and os.path.exists(cache_path):
+            response['download_url'] = f"/video/{job_data.get('video_id')}?quality={job_data.get('quality')}"
+            if job_data.get('audio_only'):
+                response['download_url'] += f"&audio_only=true&format_type={job_data.get('format_type')}"
+            
+            # Check if file is expired
+            if is_cache_file_expired(cache_path):
+                response['cache_expired'] = True
+                response['message'] = 'Cache file has expired'
+        else:
+            response['cache_missing'] = True
+            response['message'] = 'Cache file not found'
+    
+    return response
 
 @app.get("/search", response_model=List[Dict])
 async def search_youtube(

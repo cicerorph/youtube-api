@@ -75,6 +75,35 @@ Query parameters:
 - `format_type`: Output format - mp4, mkv, webm, mp3, m4a
 - `audio_only`: Set to true to extract audio only
 
+**Note:** This endpoint now supports HTTP Range headers, allowing video seeking/scrubbing in players.
+
+#### Request video download (Background Job)
+
+```
+POST /request/{video_id}
+```
+
+Query parameters (same as `/video/`):
+- `quality`: Video quality (e.g., '1080p', '720p', '480p', '360p')
+- `format_type`: Output format - mp4, mkv, webm, mp3, m4a
+- `audio_only`: Set to true to extract audio only
+
+Returns a job ID that can be used to check download status. This endpoint queues the download as a background job, allowing you to check progress without blocking.
+
+#### Check job status
+
+```
+GET /job/{job_id}
+```
+
+Returns the status of a download job including:
+- Job status (pending, downloading, completed, failed)
+- Progress information
+- Download URL when completed
+- File size and metadata
+
+**Note:** This endpoint bypasses rate limiting to allow frequent status checks.
+
 #### Search YouTube
 
 ```
