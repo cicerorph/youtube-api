@@ -14,6 +14,7 @@ import asyncio
 import time
 from typing import Optional, Dict, Tuple, List
 import yt_dlp
+import gc
 from enum import Enum
 from datetime import datetime, timedelta
 import json
@@ -242,6 +243,9 @@ async def download_with_ytdlp(video_id: str, quality: str, output_path: str):
             os.remove(output_path)
         os.rename(actual_file, output_path)
     
+    # Force garbage collection to free memory
+    gc.collect()
+    
     return output_path
 
 class FormatType(str, Enum):
@@ -297,6 +301,9 @@ async def download_audio_only(video_id: str, output_path: str, format_type: str 
         if os.path.exists(audio_output):
             os.remove(audio_output)
         os.rename(actual_file, audio_output)
+    
+    # Force garbage collection to free memory
+    gc.collect()
     
     return audio_output
 
@@ -850,6 +857,8 @@ async def download_with_pytube(video_id: str, quality: Optional[str], output_pat
     progressive_streams = yt.streams.filter(progressive=True, file_extension='mp4')
     high_quality_requested = quality and quality in ["1080p", "1440p", "2160p"] and FFMPEG_AVAILABLE
     
+    loop = asyncio.get_event_loop()
+    
     if high_quality_requested:
         video_stream = yt.streams.filter(
             adaptive=True, 
@@ -860,8 +869,8 @@ async def download_with_pytube(video_id: str, quality: Optional[str], output_pat
         
         if not video_stream:
             video_stream = progressive_streams.order_by('resolution').last()
-            with open(output_path, 'wb') as f:
-                video_stream.stream_to_buffer(f)
+            # Use download() instead of stream_to_buffer to avoid memory bloat
+            await loop.run_in_executor(None, lambda: video_stream.download(output_path=settings.CACHE_DIR, filename=os.path.basename(output_path)))
         else:
             audio_stream = yt.streams.filter(
                 adaptive=True,
@@ -875,16 +884,17 @@ async def download_with_pytube(video_id: str, quality: Optional[str], output_pat
             temp_video = os.path.join(settings.CACHE_DIR, f"{video_id}_video_temp.mp4")
             temp_audio = os.path.join(settings.CACHE_DIR, f"{video_id}_audio_temp.mp4")
             
-            with open(temp_video, 'wb') as f:
-                video_stream.stream_to_buffer(f)
-            
-            with open(temp_audio, 'wb') as f:
-                audio_stream.stream_to_buffer(f)
+            # Download directly to files instead of buffering in memory
+            await loop.run_in_executor(None, lambda: video_stream.download(output_path=settings.CACHE_DIR, filename=os.path.basename(temp_video)))
+            await loop.run_in_executor(None, lambda: audio_stream.download(output_path=settings.CACHE_DIR, filename=os.path.basename(temp_audio)))
             
             await combine_audio_video(temp_video, temp_audio, output_path)
             
-            os.remove(temp_video)
-            os.remove(temp_audio)
+            try:
+                os.remove(temp_video)
+                os.remove(temp_audio)
+            except Exception as e:
+                print(f"Error removing temp files: {e}")
     else:
         if quality:
             video_stream = progressive_streams.filter(resolution=quality).first()
@@ -896,8 +906,11 @@ async def download_with_pytube(video_id: str, quality: Optional[str], output_pat
         if not video_stream:
             raise HTTPException(status_code=404, detail="No suitable video stream found")
         
-        with open(output_path, 'wb') as f:
-            video_stream.stream_to_buffer(f)
+        # Use download() instead of stream_to_buffer to avoid memory bloat
+        await loop.run_in_executor(None, lambda: video_stream.download(output_path=settings.CACHE_DIR, filename=os.path.basename(output_path)))
+    
+    # Force garbage collection to free memory
+    gc.collect()
 
 @app.get("/status")
 async def get_api_status(request: Request):
