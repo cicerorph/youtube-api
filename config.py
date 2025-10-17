@@ -40,11 +40,6 @@ class Settings(BaseSettings):
     # Security settings
     ADMIN_API_KEY: str = "1234"        # Key for admin operations like cache management
     
-    # Multi-server settings
-    MULTI_SERVER_ENABLED: bool = False  # Enable multi-server mode
-    MULTI_SERVER_MAIN: bool = False     # Is this the main/coordinator server?
-    MULTI_SERVER_URLS: List[str] = []   # List of worker server URLs (only used when MULTI_SERVER_MAIN is True)
-    
     class Config:
         env_file = ".env"
         env_prefix = "YT_API_"
