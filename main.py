@@ -18,6 +18,9 @@ import gc
 from enum import Enum
 from datetime import datetime, timedelta
 import json
+import httpx
+import traceback
+import uvicorn
 
 from config import settings
 
@@ -121,6 +124,127 @@ def clean_expired_jobs():
 
 # Load existing jobs on startup
 load_jobs()
+
+# Multi-server system
+server_stats: Dict[str, Dict] = {}  # Track request counts per server
+server_health: Dict[str, bool] = {}  # Track server health status
+
+async def check_server_health(server_url: str) -> bool:
+    """Check if a worker server is healthy"""
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.get(f"{server_url}/status")
+            return response.status_code == 200
+    except Exception as e:
+        print(f"Health check failed for {server_url}: {str(e)}")
+        return False
+
+async def get_least_loaded_server() -> Optional[str]:
+    """Get the server with the least number of requests"""
+    if not settings.MULTI_SERVER_URLS:
+        return None
+    
+    # Initialize stats for new servers
+    for server_url in settings.MULTI_SERVER_URLS:
+        if server_url not in server_stats:
+            server_stats[server_url] = {'requests': 0, 'last_used': 0}
+        if server_url not in server_health:
+            server_health[server_url] = True
+    
+    # Filter healthy servers
+    healthy_servers = [
+        url for url in settings.MULTI_SERVER_URLS 
+        if server_health.get(url, True)
+    ]
+    
+    if not healthy_servers:
+        # If all servers are unhealthy, try them anyway
+        healthy_servers = settings.MULTI_SERVER_URLS
+    
+    # Find server with least requests
+    least_loaded = min(healthy_servers, key=lambda url: server_stats[url]['requests'])
+    
+    # Update stats
+    server_stats[least_loaded]['requests'] += 1
+    server_stats[least_loaded]['last_used'] = time.time()
+    
+    return least_loaded
+
+def release_server_slot(server_url: str):
+    """Decrement request count when request completes"""
+    if server_url in server_stats:
+        server_stats[server_url]['requests'] = max(0, server_stats[server_url]['requests'] - 1)
+
+async def check_cache_on_servers(video_id: str, quality: Optional[str], format_type: str, audio_only: bool) -> Optional[str]:
+    """Check all worker servers to see if any have the file cached"""
+    if not settings.MULTI_SERVER_URLS:
+        return None
+    
+    cache_key = f"{video_id}_{quality if quality else 'best'}"
+    if audio_only:
+        cache_key += "_audio"
+    cache_key = hashlib.md5(cache_key.encode()).hexdigest()
+    
+    # Check all servers in parallel
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        tasks = []
+        for server_url in settings.MULTI_SERVER_URLS:
+            task = client.head(
+                f"{server_url}/video/{video_id}",
+                params={
+                    "quality": quality,
+                    "format_type": format_type,
+                    "audio_only": audio_only
+                },
+                follow_redirects=False
+            )
+            tasks.append((server_url, task))
+        
+        # Wait for all checks
+        for server_url, task in tasks:
+            try:
+                response = await task
+                if response.status_code in [200, 206]:
+                    print(f"Found cached file on server: {server_url}")
+                    return server_url
+            except Exception as e:
+                print(f"Error checking cache on {server_url}: {str(e)}")
+    
+    return None
+
+async def proxy_request_to_server(server_url: str, path: str, params: dict, headers: dict) -> StreamingResponse:
+    """Proxy a request to a worker server and stream the response"""
+    try:
+        async with httpx.AsyncClient(timeout=300.0) as client:
+            # Forward the request to the worker server
+            url = f"{server_url}{path}"
+            
+            async with client.stream(
+                "GET",
+                url,
+                params=params,
+                headers=headers
+            ) as response:
+                # Get response headers
+                response_headers = dict(response.headers)
+                
+                # Remove headers that shouldn't be forwarded
+                for header in ['content-encoding', 'content-length', 'transfer-encoding', 'connection']:
+                    response_headers.pop(header, None)
+                
+                # Stream the response
+                async def stream_response():
+                    async for chunk in response.aiter_bytes(chunk_size=65536):
+                        yield chunk
+                
+                return StreamingResponse(
+                    stream_response(),
+                    status_code=response.status_code,
+                    headers=response_headers,
+                    media_type=response.headers.get('content-type', 'application/octet-stream')
+                )
+    finally:
+        release_server_slot(server_url)
 
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
@@ -317,6 +441,44 @@ async def stream_youtube_video(
 ):
     if quality is None:
         quality = settings.DEFAULT_QUALITY
+    
+    # Multi-server mode: If this is the main server, check workers first
+    if settings.MULTI_SERVER_ENABLED and settings.MULTI_SERVER_MAIN:
+        try:
+            # First, check if any worker has the file cached
+            cached_server = await check_cache_on_servers(video_id, quality, format_type.value, audio_only)
+            
+            if cached_server:
+                # Proxy request to server that has the cache
+                print(f"Proxying request to cached server: {cached_server}")
+                return await proxy_request_to_server(
+                    cached_server,
+                    f"/video/{video_id}",
+                    {
+                        "quality": quality,
+                        "format_type": format_type.value,
+                        "audio_only": audio_only
+                    },
+                    dict(request.headers)
+                )
+            
+            # No cache found, send to least loaded server
+            target_server = await get_least_loaded_server()
+            if target_server:
+                print(f"Proxying request to least loaded server: {target_server}")
+                return await proxy_request_to_server(
+                    target_server,
+                    f"/video/{video_id}",
+                    {
+                        "quality": quality,
+                        "format_type": format_type.value,
+                        "audio_only": audio_only
+                    },
+                    dict(request.headers)
+                )
+        except Exception as e:
+            print(f"Error in multi-server mode: {str(e)}")
+            # Fall through to local processing if multi-server fails
         
     try:
         cache_key = f"{video_id}_{quality if quality else 'best'}"
@@ -440,6 +602,57 @@ async def request_video_download(
     """Request a video download as a background job"""
     if quality is None:
         quality = settings.DEFAULT_QUALITY
+    
+    # Multi-server mode: If this is the main server, forward to least loaded worker
+    if settings.MULTI_SERVER_ENABLED and settings.MULTI_SERVER_MAIN:
+        try:
+            # Check if any worker has the file cached
+            cached_server = await check_cache_on_servers(video_id, quality, format_type.value, audio_only)
+            
+            if cached_server:
+                # Return info about the cached server
+                cache_key = f"{video_id}_{quality if quality else 'best'}"
+                if audio_only:
+                    cache_key += f"_audio_{format_type}"
+                job_key = hashlib.md5(cache_key.encode()).hexdigest()
+                
+                return {
+                    'job_id': job_key,
+                    'video_id': video_id,
+                    'status': 'completed',
+                    'message': f'Already cached on server: {cached_server}',
+                    'server': cached_server
+                }
+            
+            # Forward request to least loaded server
+            target_server = await get_least_loaded_server()
+            if target_server:
+                try:
+                    async with httpx.AsyncClient(timeout=30.0) as client:
+                        response = await client.post(
+                            f"{target_server}/request/{video_id}",
+                            params={
+                                "quality": quality,
+                                "format_type": format_type.value,
+                                "audio_only": audio_only
+                            }
+                        )
+                        
+                        if response.status_code == 200:
+                            result = response.json()
+                            result['server'] = target_server
+                            return result
+                        else:
+                            print(f"Worker server returned error: {response.status_code}")
+                            # Fall through to local processing
+                except Exception as e:
+                    print(f"Error forwarding to worker server: {str(e)}")
+                    # Fall through to local processing
+                finally:
+                    release_server_slot(target_server)
+        except Exception as e:
+            print(f"Error in multi-server mode: {str(e)}")
+            # Fall through to local processing
     
     try:
         # Create job key
@@ -772,6 +985,61 @@ async def get_video_info(video_id: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error retrieving video info: {str(e)}")
 
+@app.get("/admin/multi-server/stats", dependencies=[Depends(verify_admin_api_key)])
+async def get_multi_server_stats():
+    """Get statistics about multi-server setup (main server only)"""
+    if not settings.MULTI_SERVER_ENABLED or not settings.MULTI_SERVER_MAIN:
+        raise HTTPException(status_code=400, detail="Multi-server mode is not enabled or this is not the main server")
+    
+    try:
+        # Check health of all servers
+        health_checks = []
+        for server_url in settings.MULTI_SERVER_URLS:
+            is_healthy = await check_server_health(server_url)
+            server_health[server_url] = is_healthy
+            
+            stats = server_stats.get(server_url, {'requests': 0, 'last_used': 0})
+            health_checks.append({
+                'url': server_url,
+                'healthy': is_healthy,
+                'active_requests': stats['requests'],
+                'last_used': stats['last_used'],
+                'last_used_ago': int(time.time() - stats['last_used']) if stats['last_used'] > 0 else None
+            })
+        
+        return {
+            'enabled': True,
+            'is_main': True,
+            'total_workers': len(settings.MULTI_SERVER_URLS),
+            'healthy_workers': sum(1 for check in health_checks if check['healthy']),
+            'workers': health_checks
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error getting multi-server stats: {str(e)}")
+
+@app.post("/admin/multi-server/health-check", dependencies=[Depends(verify_admin_api_key)])
+async def refresh_server_health():
+    """Manually refresh health status of all worker servers"""
+    if not settings.MULTI_SERVER_ENABLED or not settings.MULTI_SERVER_MAIN:
+        raise HTTPException(status_code=400, detail="Multi-server mode is not enabled or this is not the main server")
+    
+    try:
+        results = []
+        for server_url in settings.MULTI_SERVER_URLS:
+            is_healthy = await check_server_health(server_url)
+            server_health[server_url] = is_healthy
+            results.append({
+                'url': server_url,
+                'healthy': is_healthy
+            })
+        
+        return {
+            'message': 'Health check completed',
+            'results': results
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error checking server health: {str(e)}")
+
 @app.delete("/admin/cache", dependencies=[Depends(verify_admin_api_key)])
 async def clear_cache():
     try:
@@ -923,7 +1191,7 @@ async def get_api_status(request: Request):
                          if ts > current_time - settings.RATE_LIMIT_WINDOW]
         remaining = max(0, settings.RATE_LIMIT_REQUESTS - len(valid_requests))
     
-    return {
+    status_response = {
         "status": "online",
         "version": "1.0.0",
         "rate_limit": {
@@ -940,8 +1208,18 @@ async def get_api_status(request: Request):
         "features": {
             "ffmpeg_available": FFMPEG_AVAILABLE,
             "high_quality_support": FFMPEG_AVAILABLE
+        },
+        "multi_server": {
+            "enabled": settings.MULTI_SERVER_ENABLED,
+            "is_main": settings.MULTI_SERVER_MAIN,
         }
     }
+    
+    # Add worker info if this is the main server
+    if settings.MULTI_SERVER_ENABLED and settings.MULTI_SERVER_MAIN:
+        status_response["multi_server"]["workers"] = len(settings.MULTI_SERVER_URLS)
+    
+    return status_response
 
 @app.get("/embed/{video_id}", response_class=HTMLResponse)
 async def embed_youtube_video(
