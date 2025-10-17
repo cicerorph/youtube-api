@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Query, Depends, Header, Request
+from fastapi import FastAPI, HTTPException, Query, Depends, Header, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import APIKeyHeader
@@ -18,10 +18,107 @@ import gc
 from enum import Enum
 from datetime import datetime, timedelta
 import json
+import aiohttp
+import random
+from collections import defaultdict
 
 from config import settings
 
 app = FastAPI(title="YouTube Video Streaming API")
+
+# Multi-server management
+class ServerManager:
+    def __init__(self):
+        self.servers: Dict[str, Dict] = {}  # server_url -> {status, load, last_check}
+        self.websockets: Dict[str, WebSocket] = {}  # server_url -> websocket
+        self.server_load: Dict[str, int] = defaultdict(int)  # Track current load per server
+        
+    def add_server(self, server_url: str, websocket: WebSocket = None):
+        """Register a worker server"""
+        self.servers[server_url] = {
+            'status': 'online',
+            'load': 0,
+            'last_check': time.time()
+        }
+        if websocket:
+            self.websockets[server_url] = websocket
+            
+    def remove_server(self, server_url: str):
+        """Unregister a worker server"""
+        if server_url in self.servers:
+            del self.servers[server_url]
+        if server_url in self.websockets:
+            del self.websockets[server_url]
+        if server_url in self.server_load:
+            del self.server_load[server_url]
+            
+    def get_least_loaded_server(self) -> Optional[str]:
+        """Get the server with the least load"""
+        if not self.servers:
+            return None
+        online_servers = {url: data for url, data in self.servers.items() if data['status'] == 'online'}
+        if not online_servers:
+            return None
+        return min(online_servers.keys(), key=lambda url: self.server_load.get(url, 0))
+    
+    def increment_load(self, server_url: str):
+        """Increment the load for a server"""
+        self.server_load[server_url] += 1
+        if server_url in self.servers:
+            self.servers[server_url]['load'] = self.server_load[server_url]
+    
+    def decrement_load(self, server_url: str):
+        """Decrement the load for a server"""
+        if self.server_load[server_url] > 0:
+            self.server_load[server_url] -= 1
+        if server_url in self.servers:
+            self.servers[server_url]['load'] = self.server_load[server_url]
+            
+    async def check_cache_on_servers(self, cache_key: str) -> Optional[str]:
+        """Check if any server has the cached file"""
+        for server_url in list(self.servers.keys()):
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(
+                        f"{server_url}/internal/cache/check/{cache_key}",
+                        timeout=aiohttp.ClientTimeout(total=5)
+                    ) as response:
+                        if response.status == 200:
+                            data = await response.json()
+                            if data.get('exists'):
+                                return server_url
+            except Exception as e:
+                print(f"Error checking cache on {server_url}: {str(e)}")
+        return None
+    
+    async def proxy_request_to_server(self, server_url: str, path: str, params: Dict = None):
+        """Proxy a request to a worker server"""
+        try:
+            self.increment_load(server_url)
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    f"{server_url}{path}",
+                    params=params,
+                    timeout=aiohttp.ClientTimeout(total=300)
+                ) as response:
+                    return response
+        finally:
+            self.decrement_load(server_url)
+            
+    async def broadcast_to_servers(self, message: dict):
+        """Broadcast a message to all connected worker servers via WebSocket"""
+        disconnected = []
+        for server_url, ws in self.websockets.items():
+            try:
+                await ws.send_json(message)
+            except Exception as e:
+                print(f"Error broadcasting to {server_url}: {str(e)}")
+                disconnected.append(server_url)
+        
+        for server_url in disconnected:
+            self.remove_server(server_url)
+
+server_manager = ServerManager() if settings.MULTI_SERVER_ENABLED and settings.MULTI_SERVER_MAIN else None
 
 if settings.ENABLE_CORS:
     app.add_middleware(
@@ -327,6 +424,92 @@ async def stream_youtube_video(
         file_ext = format_type.value
         cache_path = os.path.join(settings.CACHE_DIR, f"{cache_key}.{file_ext}")
         
+        # Multi-server mode: Check if this is the main server
+        if settings.MULTI_SERVER_ENABLED and settings.MULTI_SERVER_MAIN and server_manager:
+            # First, check if any worker server has this file cached
+            server_with_cache = await server_manager.check_cache_on_servers(cache_key)
+            
+            if server_with_cache:
+                # Proxy the request to the server that has the cache
+                print(f"Proxying request to {server_with_cache} (has cache)")
+                try:
+                    server_manager.increment_load(server_with_cache)
+                    async with aiohttp.ClientSession() as session:
+                        params = {
+                            'quality': quality,
+                            'format_type': format_type.value,
+                            'audio_only': str(audio_only).lower()
+                        }
+                        
+                        # Get range header from original request
+                        headers = {}
+                        if request.headers.get("range"):
+                            headers["range"] = request.headers.get("range")
+                        
+                        async with session.get(
+                            f"{server_with_cache}/video/{video_id}",
+                            params=params,
+                            headers=headers,
+                            timeout=aiohttp.ClientTimeout(total=300)
+                        ) as response:
+                            # Stream the response back to client
+                            response_headers = dict(response.headers)
+                            
+                            async def stream_from_server():
+                                async for chunk in response.content.iter_chunked(65536):
+                                    yield chunk
+                            
+                            return StreamingResponse(
+                                stream_from_server(),
+                                status_code=response.status,
+                                headers=response_headers,
+                                media_type=response.headers.get('content-type', 'video/mp4')
+                            )
+                finally:
+                    server_manager.decrement_load(server_with_cache)
+            else:
+                # No server has cache, route to least loaded server
+                target_server = server_manager.get_least_loaded_server()
+                
+                if target_server:
+                    print(f"Routing request to least loaded server: {target_server}")
+                    try:
+                        server_manager.increment_load(target_server)
+                        async with aiohttp.ClientSession() as session:
+                            params = {
+                                'quality': quality,
+                                'format_type': format_type.value,
+                                'audio_only': str(audio_only).lower()
+                            }
+                            
+                            # Get range header from original request
+                            headers = {}
+                            if request.headers.get("range"):
+                                headers["range"] = request.headers.get("range")
+                            
+                            async with session.get(
+                                f"{target_server}/video/{video_id}",
+                                params=params,
+                                headers=headers,
+                                timeout=aiohttp.ClientTimeout(total=300)
+                            ) as response:
+                                # Stream the response back to client
+                                response_headers = dict(response.headers)
+                                
+                                async def stream_from_server():
+                                    async for chunk in response.content.iter_chunked(65536):
+                                        yield chunk
+                                
+                                return StreamingResponse(
+                                    stream_from_server(),
+                                    status_code=response.status,
+                                    headers=response_headers,
+                                    media_type=response.headers.get('content-type', 'video/mp4')
+                                )
+                    finally:
+                        server_manager.decrement_load(target_server)
+                # If no workers available, fall through to handle locally
+        
         is_new = not (os.path.exists(cache_path) and os.path.getsize(cache_path) > 0)
         
         if is_new:
@@ -442,6 +625,55 @@ async def request_video_download(
         quality = settings.DEFAULT_QUALITY
     
     try:
+        # Multi-server mode: Route to least loaded server
+        if settings.MULTI_SERVER_ENABLED and settings.MULTI_SERVER_MAIN and server_manager:
+            # First check if any server has it cached
+            cache_key = f"{video_id}_{quality if quality else 'best'}"
+            if audio_only:
+                cache_key += f"_audio_{format_type}"
+            job_key = hashlib.md5(cache_key.encode()).hexdigest()
+            
+            server_with_cache = await server_manager.check_cache_on_servers(job_key)
+            
+            if server_with_cache:
+                # Return job info pointing to the server with cache
+                return {
+                    'job_id': job_key,
+                    'video_id': video_id,
+                    'status': 'completed',
+                    'message': 'File already cached on worker server',
+                    'server': server_with_cache
+                }
+            
+            # Route to least loaded server
+            target_server = server_manager.get_least_loaded_server()
+            
+            if target_server:
+                print(f"Routing download request to: {target_server}")
+                try:
+                    async with aiohttp.ClientSession() as session:
+                        params = {
+                            'quality': quality,
+                            'format_type': format_type.value,
+                            'audio_only': str(audio_only).lower()
+                        }
+                        
+                        async with session.post(
+                            f"{target_server}/request/{video_id}",
+                            params=params,
+                            timeout=aiohttp.ClientTimeout(total=30)
+                        ) as response:
+                            if response.status == 200:
+                                result = await response.json()
+                                result['server'] = target_server
+                                return result
+                            else:
+                                error_text = await response.text()
+                                print(f"Error from worker server: {error_text}")
+                except Exception as e:
+                    print(f"Error routing to worker server: {str(e)}")
+                    # Fall through to handle locally
+        
         # Create job key
         cache_key = f"{video_id}_{quality if quality else 'best'}"
         if audio_only:
@@ -1048,10 +1280,84 @@ async def embed_youtube_video(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error creating embed: {str(e)}")
 
+# ============= Multi-Server Endpoints =============
+
+@app.websocket("/ws/worker")
+async def worker_websocket(websocket: WebSocket, server_url: str = Query(..., description="Worker server URL")):
+    """WebSocket endpoint for worker servers to connect to main server"""
+    if not settings.MULTI_SERVER_ENABLED or not settings.MULTI_SERVER_MAIN:
+        await websocket.close(code=1008, reason="Multi-server mode not enabled or not main server")
+        return
+    
+    await websocket.accept()
+    server_manager.add_server(server_url, websocket)
+    print(f"Worker server connected: {server_url}")
+    
+    try:
+        while True:
+            data = await websocket.receive_json()
+            # Handle messages from worker servers
+            message_type = data.get('type')
+            
+            if message_type == 'heartbeat':
+                server_manager.servers[server_url]['last_check'] = time.time()
+                await websocket.send_json({'type': 'heartbeat_ack'})
+            elif message_type == 'load_update':
+                server_manager.server_load[server_url] = data.get('load', 0)
+                server_manager.servers[server_url]['load'] = data.get('load', 0)
+            elif message_type == 'status_update':
+                server_manager.servers[server_url]['status'] = data.get('status', 'online')
+    except WebSocketDisconnect:
+        print(f"Worker server disconnected: {server_url}")
+        server_manager.remove_server(server_url)
+    except Exception as e:
+        print(f"WebSocket error with {server_url}: {str(e)}")
+        server_manager.remove_server(server_url)
+
+@app.get("/internal/cache/check/{cache_key}")
+async def check_cache_exists(cache_key: str):
+    """Internal endpoint to check if a cache file exists on this server"""
+    # Check for different file extensions
+    extensions = ['mp4', 'mkv', 'webm', 'mp3', 'm4a']
+    
+    for ext in extensions:
+        cache_path = os.path.join(settings.CACHE_DIR, f"{cache_key}.{ext}")
+        if os.path.exists(cache_path) and os.path.getsize(cache_path) > 0 and not is_cache_file_expired(cache_path):
+            return {
+                'exists': True,
+                'cache_key': cache_key,
+                'file_size': os.path.getsize(cache_path),
+                'extension': ext
+            }
+    
+    return {'exists': False, 'cache_key': cache_key}
+
+@app.get("/admin/servers", dependencies=[Depends(verify_admin_api_key)])
+async def get_server_status():
+    """Get status of all worker servers (main server only)"""
+    if not settings.MULTI_SERVER_ENABLED or not settings.MULTI_SERVER_MAIN:
+        raise HTTPException(status_code=400, detail="Not a main server")
+    
+    if not server_manager:
+        raise HTTPException(status_code=400, detail="Server manager not initialized")
+    
+    return {
+        'servers': server_manager.servers,
+        'total_servers': len(server_manager.servers),
+        'online_servers': len([s for s in server_manager.servers.values() if s['status'] == 'online'])
+    }
+
 if __name__ == "__main__":
     import uvicorn
     print(f"Starting YouTube API server on {settings.HOST}:{settings.PORT}")
     print(f"Cache directory: {settings.CACHE_DIR}")
     print(f"FFmpeg available: {FFMPEG_AVAILABLE}")
+    
+    if settings.MULTI_SERVER_ENABLED:
+        if settings.MULTI_SERVER_MAIN:
+            print(f"Multi-server mode: MAIN SERVER")
+            print(f"Configured worker servers: {len(settings.MULTI_SERVER_URLS)}")
+        else:
+            print(f"Multi-server mode: WORKER SERVER")
     
     uvicorn.run(app, host=settings.HOST, port=settings.PORT)
