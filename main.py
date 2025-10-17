@@ -442,44 +442,46 @@ async def stream_youtube_video(
     if quality is None:
         quality = settings.DEFAULT_QUALITY
     
-    # Multi-server mode: If this is the main server, check workers first
+    # Multi-server mode: If this is the main server, only proxy - never download locally
     if settings.MULTI_SERVER_ENABLED and settings.MULTI_SERVER_MAIN:
-        try:
-            # First, check if any worker has the file cached
-            cached_server = await check_cache_on_servers(video_id, quality, format_type.value, audio_only)
-            
-            if cached_server:
-                # Proxy request to server that has the cache
-                print(f"Proxying request to cached server: {cached_server}")
-                return await proxy_request_to_server(
-                    cached_server,
-                    f"/video/{video_id}",
-                    {
-                        "quality": quality,
-                        "format_type": format_type.value,
-                        "audio_only": audio_only
-                    },
-                    dict(request.headers)
-                )
-            
-            # No cache found, send to least loaded server
-            target_server = await get_least_loaded_server()
-            if target_server:
-                print(f"Proxying request to least loaded server: {target_server}")
-                return await proxy_request_to_server(
-                    target_server,
-                    f"/video/{video_id}",
-                    {
-                        "quality": quality,
-                        "format_type": format_type.value,
-                        "audio_only": audio_only
-                    },
-                    dict(request.headers)
-                )
-        except Exception as e:
-            print(f"Error in multi-server mode: {str(e)}")
-            # Fall through to local processing if multi-server fails
+        # First, check if any worker has the file cached
+        cached_server = await check_cache_on_servers(video_id, quality, format_type.value, audio_only)
         
+        if cached_server:
+            # Proxy request to server that has the cache
+            print(f"Proxying request to cached server: {cached_server}")
+            return await proxy_request_to_server(
+                cached_server,
+                f"/video/{video_id}",
+                {
+                    "quality": quality,
+                    "format_type": format_type.value,
+                    "audio_only": audio_only
+                },
+                dict(request.headers)
+            )
+        
+        # No cache found, send to least loaded server
+        target_server = await get_least_loaded_server()
+        if target_server:
+            print(f"Proxying request to least loaded server: {target_server}")
+            return await proxy_request_to_server(
+                target_server,
+                f"/video/{video_id}",
+                {
+                    "quality": quality,
+                    "format_type": format_type.value,
+                    "audio_only": audio_only
+                },
+                dict(request.headers)
+            )
+        else:
+            raise HTTPException(
+                status_code=503, 
+                detail="No worker servers available. Please configure MULTI_SERVER_URLS."
+            )
+    
+    # Worker mode or standalone mode: handle downloads locally
     try:
         cache_key = f"{video_id}_{quality if quality else 'best'}"
         if audio_only:
@@ -603,57 +605,63 @@ async def request_video_download(
     if quality is None:
         quality = settings.DEFAULT_QUALITY
     
-    # Multi-server mode: If this is the main server, forward to least loaded worker
+    # Multi-server mode: If this is the main server, only proxy - never download locally
     if settings.MULTI_SERVER_ENABLED and settings.MULTI_SERVER_MAIN:
-        try:
-            # Check if any worker has the file cached
-            cached_server = await check_cache_on_servers(video_id, quality, format_type.value, audio_only)
+        # Check if any worker has the file cached
+        cached_server = await check_cache_on_servers(video_id, quality, format_type.value, audio_only)
+        
+        if cached_server:
+            # Return info about the cached server
+            cache_key = f"{video_id}_{quality if quality else 'best'}"
+            if audio_only:
+                cache_key += f"_audio_{format_type}"
+            job_key = hashlib.md5(cache_key.encode()).hexdigest()
             
-            if cached_server:
-                # Return info about the cached server
-                cache_key = f"{video_id}_{quality if quality else 'best'}"
-                if audio_only:
-                    cache_key += f"_audio_{format_type}"
-                job_key = hashlib.md5(cache_key.encode()).hexdigest()
-                
-                return {
-                    'job_id': job_key,
-                    'video_id': video_id,
-                    'status': 'completed',
-                    'message': f'Already cached on server: {cached_server}',
-                    'server': cached_server
-                }
-            
-            # Forward request to least loaded server
-            target_server = await get_least_loaded_server()
-            if target_server:
-                try:
-                    async with httpx.AsyncClient(timeout=30.0) as client:
-                        response = await client.post(
-                            f"{target_server}/request/{video_id}",
-                            params={
-                                "quality": quality,
-                                "format_type": format_type.value,
-                                "audio_only": audio_only
-                            }
+            return {
+                'job_id': job_key,
+                'video_id': video_id,
+                'status': 'completed',
+                'message': f'Already cached on server: {cached_server}',
+                'server': cached_server
+            }
+        
+        # Forward request to least loaded server
+        target_server = await get_least_loaded_server()
+        if target_server:
+            try:
+                async with httpx.AsyncClient(timeout=30.0) as client:
+                    response = await client.post(
+                        f"{target_server}/request/{video_id}",
+                        params={
+                            "quality": quality,
+                            "format_type": format_type.value,
+                            "audio_only": audio_only
+                        }
+                    )
+                    
+                    if response.status_code == 200:
+                        result = response.json()
+                        result['server'] = target_server
+                        return result
+                    else:
+                        raise HTTPException(
+                            status_code=response.status_code,
+                            detail=f"Worker server returned error: {response.text}"
                         )
-                        
-                        if response.status_code == 200:
-                            result = response.json()
-                            result['server'] = target_server
-                            return result
-                        else:
-                            print(f"Worker server returned error: {response.status_code}")
-                            # Fall through to local processing
-                except Exception as e:
-                    print(f"Error forwarding to worker server: {str(e)}")
-                    # Fall through to local processing
-                finally:
-                    release_server_slot(target_server)
-        except Exception as e:
-            print(f"Error in multi-server mode: {str(e)}")
-            # Fall through to local processing
+            except httpx.HTTPError as e:
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"Error communicating with worker server {target_server}: {str(e)}"
+                )
+            finally:
+                release_server_slot(target_server)
+        else:
+            raise HTTPException(
+                status_code=503,
+                detail="No worker servers available. Please configure MULTI_SERVER_URLS."
+            )
     
+    # Worker mode or standalone mode: handle downloads locally
     try:
         # Create job key
         cache_key = f"{video_id}_{quality if quality else 'best'}"
@@ -1331,5 +1339,17 @@ if __name__ == "__main__":
     print(f"Starting YouTube API server on {settings.HOST}:{settings.PORT}")
     print(f"Cache directory: {settings.CACHE_DIR}")
     print(f"FFmpeg available: {FFMPEG_AVAILABLE}")
+    
+    # Multi-server mode info
+    if settings.MULTI_SERVER_ENABLED:
+        if settings.MULTI_SERVER_MAIN:
+            print(f"Multi-server mode: MAIN SERVER (Load Balancer)")
+            print(f"Worker servers configured: {len(settings.MULTI_SERVER_URLS)}")
+            for idx, url in enumerate(settings.MULTI_SERVER_URLS, 1):
+                print(f"  Worker {idx}: {url}")
+        else:
+            print(f"Multi-server mode: WORKER SERVER")
+    else:
+        print(f"Multi-server mode: DISABLED (Standalone)")
     
     uvicorn.run(app, host=settings.HOST, port=settings.PORT)
