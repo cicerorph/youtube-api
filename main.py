@@ -1431,7 +1431,7 @@ async def embed_youtube_video(
                 }}
             }});
         }});
-    </script>
+        </script>
 </body>
 </html>
         """
@@ -1459,4 +1459,4 @@ if __name__ == "__main__":
     else:
         print(f"Multi-server mode: DISABLED (Standalone)")
 
-    uvicorn.run(app, host=settings.HOST, port=settings.PORT)
+    uvicorn.run(app, host=None, port=settings.PORT)
