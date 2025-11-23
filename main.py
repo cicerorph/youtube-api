@@ -989,7 +989,7 @@ async def search_youtube(
                     "uploader": entry.get('uploader'),
                     "duration": entry.get('duration'),
                     "view_count": entry.get('view_count'),
-                    "thumbnail": entry.get('thumbnail'),
+                    "thumbnail": entry.get('thumbnail_url'),
                     "url": f"https://www.youtube.com/watch?v={entry.get('id')}"
                 })
 
