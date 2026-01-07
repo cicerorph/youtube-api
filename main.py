@@ -957,7 +957,7 @@ async def search_youtube(
     query: str = Query(..., description="Search terms"),
     max_results: int = Query(10, description=f"Maximum number of results to return (1-{settings.MAX_SEARCH_RESULTS})", ge=1, le=settings.MAX_SEARCH_RESULTS)
 ):
-    try:
+    try:    
         loop = asyncio.get_event_loop()
 
         ydl_opts = {
@@ -983,13 +983,18 @@ async def search_youtube(
         formatted_results = []
         for entry in search_results['entries']:
             if entry:
+                thumbnail = (
+                    entry.get('thumbnail') or 
+                    entry.get('thumbnails', [{}])[-1].get('url') if entry.get('thumbnails') else None
+                )
+                
                 formatted_results.append({
                     "id": entry.get('id'),
                     "title": entry.get('title'),
-                    "uploader": entry.get('uploader'),
+                    "uploader": entry.get('uploader') or entry.get('channel'),
                     "duration": entry.get('duration'),
                     "view_count": entry.get('view_count'),
-                    "thumbnail": entry.get('thumbnail_url'),
+                    "thumbnail": thumbnail,
                     "url": f"https://www.youtube.com/watch?v={entry.get('id')}"
                 })
 
@@ -1001,7 +1006,7 @@ async def search_youtube(
         print(f"Error in search_youtube: {error_detail}")
         print(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"Error searching YouTube: {error_detail}")
-
+        
 @app.get("/video/{video_id}/info")
 async def get_video_info(video_id: str):
     try:
